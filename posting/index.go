@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/golang/glog"
+	"github.com/pkg/errors"
 	ostats "go.opencensus.io/stats"
 	otrace "go.opencensus.io/trace"
 
@@ -40,7 +41,6 @@ import (
 	"github.com/dgraph-io/dgraph/tok"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
-	"github.com/pkg/errors"
 )
 
 var emptyCountParams countParams
@@ -52,7 +52,7 @@ type indexMutationInfo struct {
 	op         pb.DirectedEdge_Op
 }
 
-// indexTokensforTokenizers return tokens, without the predicate prefix and
+// indexTokens return tokens, without the predicate prefix and
 // index rune, for specific tokenizers.
 func indexTokens(info *indexMutationInfo) ([]string, error) {
 	attr := info.edge.Attr
@@ -63,7 +63,7 @@ func indexTokens(info *indexMutationInfo) ([]string, error) {
 		return nil, errors.Errorf("Cannot index attribute %s of type object.", attr)
 	}
 
-	if !schema.State().IsIndexed(attr) {
+	if !schema.State().IsIndexed(schema.WriteCtx, attr) {
 		return nil, errors.Errorf("Attribute %s is not indexed.", attr)
 	}
 	sv, err := types.Convert(info.val, schemaType)
@@ -87,14 +87,13 @@ func indexTokens(info *indexMutationInfo) ([]string, error) {
 // TODO - See if we need to pass op as argument as t should already have Op.
 func (txn *Txn) addIndexMutations(ctx context.Context, info *indexMutationInfo) error {
 	if info.tokenizers == nil {
-		info.tokenizers = schema.State().Tokenizer(info.edge.Attr)
+		info.tokenizers = schema.State().Tokenizer(schema.WriteCtx, info.edge.Attr)
 	}
 
 	attr := info.edge.Attr
 	uid := info.edge.Entity
 	x.AssertTrue(uid != 0)
 	tokens, err := indexTokens(info)
-
 	if err != nil {
 		// This data is not indexable
 		return err
@@ -238,10 +237,9 @@ func (txn *Txn) addReverseAndCountMutation(ctx context.Context, t *pb.DirectedEd
 	return nil
 }
 
-func (l *List) handleDeleteAll(ctx context.Context, edge *pb.DirectedEdge,
-	txn *Txn) error {
+func (l *List) handleDeleteAll(ctx context.Context, edge *pb.DirectedEdge, txn *Txn) error {
 	isReversed := schema.State().IsReversed(edge.Attr)
-	isIndexed := schema.State().IsIndexed(edge.Attr)
+	isIndexed := schema.State().IsIndexed(schema.WriteCtx, edge.Attr)
 	hasCount := schema.State().HasCount(edge.Attr)
 	delEdge := &pb.DirectedEdge{
 		Attr:   edge.Attr,
@@ -264,7 +262,7 @@ func (l *List) handleDeleteAll(ctx context.Context, edge *pb.DirectedEdge,
 				Value: p.Value,
 			}
 			return txn.addIndexMutations(ctx, &indexMutationInfo{
-				tokenizers: schema.State().Tokenizer(edge.Attr),
+				tokenizers: schema.State().Tokenizer(schema.WriteCtx, edge.Attr),
 				edge:       edge,
 				val:        val,
 				op:         pb.DirectedEdge_DEL,
@@ -415,7 +413,7 @@ func (l *List) AddMutationWithIndex(ctx context.Context, edge *pb.DirectedEdge,
 		return l.handleDeleteAll(ctx, edge, txn)
 	}
 
-	doUpdateIndex := pstore != nil && schema.State().IsIndexed(edge.Attr)
+	doUpdateIndex := pstore != nil && schema.State().IsIndexed(schema.WriteCtx, edge.Attr)
 	hasCountIndex := schema.State().HasCount(edge.Attr)
 	val, found, cp, err := txn.addMutationHelper(ctx, l, doUpdateIndex, hasCountIndex, edge)
 	if err != nil {
@@ -431,7 +429,7 @@ func (l *List) AddMutationWithIndex(ctx context.Context, edge *pb.DirectedEdge,
 		// Exact matches.
 		if found && val.Value != nil {
 			if err := txn.addIndexMutations(ctx, &indexMutationInfo{
-				tokenizers: schema.State().Tokenizer(edge.Attr),
+				tokenizers: schema.State().Tokenizer(schema.WriteCtx, edge.Attr),
 				edge:       edge,
 				val:        val,
 				op:         pb.DirectedEdge_DEL,
@@ -445,7 +443,7 @@ func (l *List) AddMutationWithIndex(ctx context.Context, edge *pb.DirectedEdge,
 				Value: edge.Value,
 			}
 			if err := txn.addIndexMutations(ctx, &indexMutationInfo{
-				tokenizers: schema.State().Tokenizer(edge.Attr),
+				tokenizers: schema.State().Tokenizer(schema.WriteCtx, edge.Attr),
 				edge:       edge,
 				val:        val,
 				op:         pb.DirectedEdge_SET,
@@ -544,17 +542,17 @@ func (r *rebuilder) Run(ctx context.Context) error {
 	// indexes that may have been left around in case defer wasn't executed.
 	// TODO(Aman): If users are not happy, we could add a flag to choose this dir.
 	tmpParentDir := filepath.Join(os.TempDir(), "dgraph_index")
+	if err := os.MkdirAll(tmpParentDir, os.ModePerm); err != nil {
+		return errors.Wrap(err, "error creating in base temp dir for reindexing")
+	}
 
 	// We write the index in a temporary badger first and then,
 	// merge entries before writing them to p directory.
-	if err := os.MkdirAll(tmpParentDir, os.ModePerm); err != nil {
-		return errors.Wrap(err, "error creating in temp dir for reindexing")
-	}
 	tmpIndexDir, err := ioutil.TempDir(tmpParentDir, "")
 	if err != nil {
 		return errors.Wrap(err, "error creating temp dir for reindexing")
 	}
-	defer os.RemoveAll(tmpParentDir)
+	defer os.RemoveAll(tmpIndexDir)
 	glog.V(1).Infof("Rebuilding indexes using the temp folder %s\n", tmpIndexDir)
 
 	dbOpts := badger.DefaultOptions(tmpIndexDir).
@@ -714,11 +712,57 @@ const (
 	indexRebuild         = iota // Index should be deleted and rebuilt.
 )
 
-// Run rebuilds all indices that need it.
-func (rb *IndexRebuild) Run(ctx context.Context) error {
-	if err := rebuildListType(ctx, rb); err != nil {
+func (rb *IndexRebuild) GetInterimSchema() *pb.SchemaUpdate {
+	interimUpdate := *rb.CurrentSchema
+	info := rb.needsIndexRebuild()
+
+	fmt.Printf("%+v\n", info)
+	interimTokenizers := rb.OldSchema.Tokenizer[:0]
+	for _, t := range rb.OldSchema.Tokenizer {
+		found := false
+		for _, i := range info.tokenizersToDelete {
+			if t == i {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			interimTokenizers = append(interimTokenizers, t)
+		}
+	}
+	interimUpdate.Tokenizer = interimTokenizers
+
+	if rb.needsCountIndexRebuild() == indexRebuild {
+		interimUpdate.Count = false
+	}
+
+	if rb.needsReverseEdgesRebuild() == indexRebuild {
+		interimUpdate.Directive = pb.SchemaUpdate_NONE
+	}
+	fmt.Printf("%+v\n", interimUpdate)
+
+	return &interimUpdate
+}
+
+// DropIndexes drops indexes.
+func (rb *IndexRebuild) DropIndexes(ctx context.Context) error {
+	if err := dropIndex(ctx, rb); err != nil {
 		return err
 	}
+	if err := dropReverseEdges(ctx, rb); err != nil {
+		return err
+	}
+	return dropCountIndex(ctx, rb)
+}
+
+// BuildData updates data.
+func (rb *IndexRebuild) BuildData(ctx context.Context) error {
+	return rebuildListType(ctx, rb)
+}
+
+// BuildIndexes builds indexes.
+func (rb *IndexRebuild) BuildIndexes(ctx context.Context) error {
 	if err := rebuildIndex(ctx, rb); err != nil {
 		return err
 	}
@@ -802,12 +846,8 @@ func (rb *IndexRebuild) needsIndexRebuild() indexRebuildInfo {
 	}
 }
 
-// rebuildIndex rebuilds index for a given attribute.
-// We commit mutations with startTs and ignore the errors.
-func rebuildIndex(ctx context.Context, rb *IndexRebuild) error {
-	// Exit early if indices do not need to be rebuilt.
+func dropIndex(ctx context.Context, rb *IndexRebuild) error {
 	rebuildInfo := rb.needsIndexRebuild()
-
 	if rebuildInfo.op == indexNoop {
 		return nil
 	}
@@ -826,8 +866,14 @@ func rebuildIndex(ctx context.Context, rb *IndexRebuild) error {
 		}
 	}
 
-	// Exit early if the index only need to be deleted and not rebuilt.
-	if rebuildInfo.op == indexDelete {
+	return nil
+}
+
+// rebuildIndex rebuilds index for a given attribute.
+// We commit mutations with startTs and ignore the errors.
+func rebuildIndex(ctx context.Context, rb *IndexRebuild) error {
+	rebuildInfo := rb.needsIndexRebuild()
+	if rebuildInfo.op != indexRebuild {
 		return nil
 	}
 
@@ -838,19 +884,6 @@ func rebuildIndex(ctx context.Context, rb *IndexRebuild) error {
 
 	glog.Infof("Rebuilding index for attr %s and tokenizers %s", rb.Attr,
 		rebuildInfo.tokenizersToRebuild)
-	// Before rebuilding, the existing index needs to be deleted.
-	for _, tokenizer := range rebuildInfo.tokenizersToRebuild {
-		if err := deleteTokensFor(rb.Attr, tokenizer, false); err != nil {
-			return err
-		}
-		if tokenizer != "exact" {
-			continue
-		}
-		if err := deleteTokensFor(rb.Attr, tokenizer, true); err != nil {
-			return err
-		}
-	}
-
 	tokenizers, err := tok.GetTokenizers(rebuildInfo.tokenizersToRebuild)
 	if err != nil {
 		return err
@@ -912,8 +945,8 @@ func (rb *IndexRebuild) needsCountIndexRebuild() indexOp {
 	return indexRebuild
 }
 
-// rebuildCountIndex rebuilds the count index for a given attribute.
-func rebuildCountIndex(ctx context.Context, rb *IndexRebuild) error {
+func dropCountIndex(ctx context.Context, rb *IndexRebuild) error {
+	// Exit early if indices do not need to be rebuilt.
 	op := rb.needsCountIndexRebuild()
 	if op == indexNoop {
 		return nil
@@ -924,8 +957,13 @@ func rebuildCountIndex(ctx context.Context, rb *IndexRebuild) error {
 		return err
 	}
 
-	// Exit early if attribute is index only needed to be deleted.
-	if op == indexDelete {
+	return nil
+}
+
+// rebuildCountIndex rebuilds the count index for a given attribute.
+func rebuildCountIndex(ctx context.Context, rb *IndexRebuild) error {
+	op := rb.needsCountIndexRebuild()
+	if op != indexRebuild {
 		return nil
 	}
 
@@ -996,20 +1034,20 @@ func (rb *IndexRebuild) needsReverseEdgesRebuild() indexOp {
 	return indexDelete
 }
 
-// rebuildReverseEdges rebuilds the reverse edges for a given attribute.
-func rebuildReverseEdges(ctx context.Context, rb *IndexRebuild) error {
+func dropReverseEdges(ctx context.Context, rb *IndexRebuild) error {
 	op := rb.needsReverseEdgesRebuild()
 	if op == indexNoop {
 		return nil
 	}
 
 	glog.Infof("Deleting reverse index for %s", rb.Attr)
-	if err := deleteReverseEdges(rb.Attr); err != nil {
-		return err
-	}
+	return deleteReverseEdges(rb.Attr)
+}
 
-	// Exit early if index only needed to be deleted.
-	if op == indexDelete {
+// rebuildReverseEdges rebuilds the reverse edges for a given attribute.
+func rebuildReverseEdges(ctx context.Context, rb *IndexRebuild) error {
+	op := rb.needsReverseEdgesRebuild()
+	if op != indexRebuild {
 		return nil
 	}
 

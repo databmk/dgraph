@@ -17,7 +17,9 @@
 package alpha
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -184,4 +186,84 @@ func TestReindexReverseCount(t *testing.T) {
       ]
     }
   }`, res)
+}
+
+func TestBgIndexSchemaReverse(t *testing.T) {
+	require.NoError(t, dropAll())
+	require.NoError(t, alterSchema(`value: [uid] .`))
+
+	time.Sleep(time.Second * 5)
+	go func() {
+		time.Sleep(time.Second)
+		// reindex
+		require.NoError(t, alterSchema(`value: [uid] @count @reverse .`))
+	}()
+
+	q1 := `schema(pred: [value]) {}`
+	for i := 0; i < 10; i++ {
+		res, _, err := queryWithTs(q1, "application/graphql+-", "", 0)
+		require.NoError(t, err)
+		fmt.Println(res)
+		time.Sleep(time.Second)
+	}
+}
+
+func TestBgIndexSchemaTokenizers(t *testing.T) {
+	require.NoError(t, dropAll())
+	require.NoError(t, alterSchema(`value: string @index(fulltext, hash) .`))
+
+	time.Sleep(time.Second * 5)
+	go func() {
+		time.Sleep(time.Second)
+		// reindex
+		require.NoError(t, alterSchema(`value: string @index(term, hash) @upsert .`))
+	}()
+
+	q1 := `schema(pred: [value]) {}`
+	for i := 0; i < 10; i++ {
+		res, _, err := queryWithTs(q1, "application/graphql+-", "", 0)
+		require.NoError(t, err)
+		fmt.Println(res)
+		time.Sleep(time.Second)
+	}
+}
+
+func TestBgIndexSchemaCount(t *testing.T) {
+	require.NoError(t, dropAll())
+	require.NoError(t, alterSchema(`value: [uid] @count .`))
+
+	time.Sleep(time.Second * 5)
+	go func() {
+		time.Sleep(time.Second)
+		// reindex
+		require.NoError(t, alterSchema(`value: [uid] @reverse .`))
+	}()
+
+	q1 := `schema(pred: [value]) {}`
+	for i := 0; i < 10; i++ {
+		res, _, err := queryWithTs(q1, "application/graphql+-", "", 0)
+		require.NoError(t, err)
+		fmt.Println(res)
+		time.Sleep(time.Second)
+	}
+}
+
+func TestBgIndexSchemaReverse2(t *testing.T) {
+	require.NoError(t, dropAll())
+	require.NoError(t, alterSchema(`value: [uid] @reverse .`))
+
+	time.Sleep(time.Second * 5)
+	go func() {
+		time.Sleep(time.Second)
+		// reindex
+		require.NoError(t, alterSchema(`value: [uid] @count .`))
+	}()
+
+	q1 := `schema(pred: [value]) {}`
+	for i := 0; i < 10; i++ {
+		res, _, err := queryWithTs(q1, "application/graphql+-", "", 0)
+		require.NoError(t, err)
+		fmt.Println(res)
+		time.Sleep(time.Second)
+	}
 }
